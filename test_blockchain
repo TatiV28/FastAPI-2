@@ -1,0 +1,462 @@
+"""
+Тесты для демонстрации качества кода и покрытия функциональности
+Запуск: python -m pytest test_blockchain.py -v
+"""
+
+import pytest
+import uuid
+import time
+from main import (
+    CryptoManager, UTXOManager, Blockchain, ABTestManager,
+    Transaction, TransactionInput, TransactionOutput, ABTestGroup
+)
+
+
+class TestCryptoManager:
+    """Тесты криптографических функций"""
+    
+    def test_key_generation(self):
+        """Тест генерации RSA ключей"""
+        keys = CryptoManager.generate_key_pair()
+        
+        assert "private_key" in keys
+        assert "public_key" in keys
+        assert "BEGIN PRIVATE KEY" in keys["private_key"]
+        assert "BEGIN PUBLIC KEY" in keys["public_key"]
+    
+    def test_digital_signature(self):
+        """Тест цифровой подписи"""
+        keys = CryptoManager.generate_key_pair()
+        message = "Test message for signing"
+        
+        # Подписываем сообщение
+        signature = CryptoManager.sign_data(keys["private_key"], message)
+        assert isinstance(signature, str)
+        assert len(signature) > 0
+        
+        # Проверяем подпись
+        is_valid = CryptoManager.verify_signature(
+            keys["public_key"], message, signature
+        )
+        assert is_valid is True
+        
+        # Проверяем с неправильным сообщением
+        is_valid_wrong = CryptoManager.verify_signature(
+            keys["public_key"], "Wrong message", signature
+        )
+        assert is_valid_wrong is False
+    
+    def test_hash_function(self):
+        """Тест хеширования"""
+        message = "Hello, blockchain!"
+        hash1 = CryptoManager.hash_data(message)
+        hash2 = CryptoManager.hash_data(message)
+        
+        # Хеши одинаковых данных должны совпадать
+        assert hash1 == hash2
+        assert len(hash1) == 64  # SHA-256 = 32 байта = 64 hex символа
+        
+        # Хеши разных данных должны отличаться
+        hash3 = CryptoManager.hash_data("Different message")
+        assert hash1 != hash3
+    
+    def test_merkle_root(self):
+        """Тест дерева Меркла"""
+        # Тест с пустым списком
+        assert CryptoManager.merkle_root([]) == ""
+        
+        # Тест с одним элементом
+        single_hash = "abc123"
+        assert CryptoManager.merkle_root([single_hash]) == single_hash
+        
+        # Тест с несколькими элементами
+        hashes = ["hash1", "hash2", "hash3", "hash4"]
+        root = CryptoManager.merkle_root(hashes)
+        assert isinstance(root, str)
+        assert len(root) == 64  # SHA-256
+
+
+class TestUTXOManager:
+    """Тесты UTXO системы"""
+    
+    def setup_method(self):
+        """Настройка для каждого теста"""
+        self.utxo_manager = UTXOManager()
+    
+    def test_add_and_get_utxo(self):
+        """Тест добавления и получения UTXO"""
+        tx_id = "tx123"
+        output = TransactionOutput(amount=50.0, recipient="alice")
+        
+        # Добавляем UTXO
+        self.utxo_manager.add_utxo(tx_id, 0, output)
+        
+        # Проверяем баланс
+        balance = self.utxo_manager.get_balance("alice")
+        assert balance == 50.0
+        
+        # Проверяем UTXO
+        utxos = self.utxo_manager.get_utxos_for_address("alice")
+        assert len(utxos) == 1
+        assert utxos[0]["tx_id"] == tx_id
+        assert utxos[0]["amount"] == 50.0
+    
+    def test_spend_utxo(self):
+        """Тест траты UTXO"""
+        tx_id = "tx123"
+        output = TransactionOutput(amount=50.0, recipient="alice")
+        
+        # Добавляем UTXO
+        self.utxo_manager.add_utxo(tx_id, 0, output)
+        
+        # Тратим UTXO
+        success = self.utxo_manager.spend_utxo(tx_id, 0)
+        assert success is True
+        
+        # Баланс должен стать 0
+        balance = self.utxo_manager.get_balance("alice")
+        assert balance == 0.0
+        
+        # Повторная трата должна не пройти
+        success_again = self.utxo_manager.spend_utxo(tx_id, 0)
+        assert success_again is False
+    
+    def test_multiple_utxos(self):
+        """Тест с несколькими UTXO"""
+        # Добавляем несколько UTXO для одного адреса
+        self.utxo_manager.add_utxo("tx1", 0, TransactionOutput(amount=30.0, recipient="alice"))
+        self.utxo_manager.add_utxo("tx2", 0, TransactionOutput(amount=20.0, recipient="alice"))
+        self.utxo_manager.add_utxo("tx3", 1, TransactionOutput(amount=10.0, recipient="bob"))
+        
+        # Проверяем балансы
+        alice_balance = self.utxo_manager.get_balance("alice")
+        bob_balance = self.utxo_manager.get_balance("bob")
+        
+        assert alice_balance == 50.0
+        assert bob_balance == 10.0
+        
+        # Проверяем количество UTXO
+        alice_utxos = self.utxo_manager.get_utxos_for_address("alice")
+        bob_utxos = self.utxo_manager.get_utxos_for_address("bob")
+        
+        assert len(alice_utxos) == 2
+        assert len(bob_utxos) == 1
+
+
+class TestBlockchain:
+    """Тесты блокчейна"""
+    
+    def setup_method(self):
+        """Настройка для каждого теста"""
+        self.blockchain = Blockchain()
+    
+    def test_genesis_block(self):
+        """Тест генезис блока"""
+        assert len(self.blockchain.chain) == 1
+        
+        genesis_block = self.blockchain.chain[0]
+        assert genesis_block.index == 0
+        assert genesis_block.previous_hash == "0"
+        assert len(genesis_block.transactions) == 1
+        
+        # Проверяем баланс genesis адреса
+        balance = self.blockchain.utxo_manager.get_balance("genesis_address")
+        assert balance == 1000.0
+    
+    def test_calculate_hash(self):
+        """Тест вычисления хеша блока"""
+        block = self.blockchain.chain[0]
+        calculated_hash = self.blockchain.calculate_hash(block)
+        
+        assert isinstance(calculated_hash, str)
+        assert len(calculated_hash) == 64
+        assert calculated_hash == block.hash
+    
+    def test_transaction_validation(self):
+        """Тест валидации транзакций"""
+        # Валидная транзакция от genesis
+        genesis_utxos = self.blockchain.utxo_manager.get_utxos_for_address("genesis_address")
+        
+        valid_transaction = Transaction(
+            id=str(uuid.uuid4()),
+            inputs=[TransactionInput(
+                tx_id=genesis_utxos[0]["tx_id"],
+                output_index=genesis_utxos[0]["output_index"]
+            )],
+            outputs=[
+                TransactionOutput(amount=50.0, recipient="alice"),
+                TransactionOutput(amount=949.0, recipient="genesis_address")  # сдача
+            ],
+            timestamp=time.time(),
+            fee=1.0
+        )
+        
+        is_valid = self.blockchain.validate_transaction(valid_transaction)
+        assert is_valid is True
+        
+        # Невалидная транзакция (больше выходов чем входов)
+        invalid_transaction = Transaction(
+            id=str(uuid.uuid4()),
+            inputs=[TransactionInput(
+                tx_id=genesis_utxos[0]["tx_id"],
+                output_index=genesis_utxos[0]["output_index"]
+            )],
+            outputs=[
+                TransactionOutput(amount=2000.0, recipient="alice")  # больше чем есть
+            ],
+            timestamp=time.time(),
+            fee=1.0
+        )
+        
+        is_invalid = self.blockchain.validate_transaction(invalid_transaction)
+        assert is_invalid is False
+    
+    def test_add_transaction(self):
+        """Тест добавления транзакции"""
+        genesis_utxos = self.blockchain.utxo_manager.get_utxos_for_address("genesis_address")
+        
+        transaction = Transaction(
+            id=str(uuid.uuid4()),
+            inputs=[TransactionInput(
+                tx_id=genesis_utxos[0]["tx_id"],
+                output_index=genesis_utxos[0]["output_index"]
+            )],
+            outputs=[
+                TransactionOutput(amount=50.0, recipient="alice"),
+                TransactionOutput(amount=949.0, recipient="genesis_address")
+            ],
+            timestamp=time.time(),
+            fee=1.0
+        )
+        
+        # Добавляем транзакцию
+        success = self.blockchain.add_transaction(transaction)
+        assert success is True
+        assert len(self.blockchain.pending_transactions) == 1
+        
+        # Пытаемся добавить невалидную
+        invalid_tx = Transaction(
+            id=str(uuid.uuid4()),
+            inputs=[TransactionInput(tx_id="nonexistent", output_index=0)],
+            outputs=[TransactionOutput(amount=100.0, recipient="bob")],
+            timestamp=time.time(),
+            fee=1.0
+        )
+        
+        success_invalid = self.blockchain.add_transaction(invalid_tx)
+        assert success_invalid is False
+        assert len(self.blockchain.pending_transactions) == 1  # не увеличилось
+    
+    def test_mine_block(self):
+        """Тест майнинга блока"""
+        # Добавляем транзакцию
+        genesis_utxos = self.blockchain.utxo_manager.get_utxos_for_address("genesis_address")
+        
+        transaction = Transaction(
+            id=str(uuid.uuid4()),
+            inputs=[TransactionInput(
+                tx_id=genesis_utxos[0]["tx_id"],
+                output_index=genesis_utxos[0]["output_index"]
+            )],
+            outputs=[
+                TransactionOutput(amount=50.0, recipient="alice"),
+                TransactionOutput(amount=949.0, recipient="genesis_address")
+            ],
+            timestamp=time.time(),
+            fee=1.0
+        )
+        
+        self.blockchain.add_transaction(transaction)
+        
+        # Майним блок
+        initial_chain_length = len(self.blockchain.chain)
+        new_block = self.blockchain.mine_block(difficulty=1)
+        
+        # Проверяем результат
+        assert len(self.blockchain.chain) == initial_chain_length + 1
+        assert new_block.index == 1
+        assert new_block.previous_hash == self.blockchain.chain[0].hash
+        assert new_block.hash.startswith("0")  # difficulty=1
+        assert len(self.blockchain.pending_transactions) == 0
+        
+        # Проверяем обновление UTXO
+        alice_balance = self.blockchain.utxo_manager.get_balance("alice")
+        assert alice_balance == 50.0
+
+
+class TestABTestManager:
+    """Тесты A/B тестирования"""
+    
+    def setup_method(self):
+        """Настройка для каждого теста"""
+        self.ab_manager = ABTestManager()
+    
+    def test_user_assignment(self):
+        """Тест назначения пользователей в группы"""
+        user_id = "user123"
+        feature = "new_ui"
+        
+        # Назначаем пользователя
+        group1 = self.ab_manager.assign_user_to_group(user_id, feature)
+        group2 = self.ab_manager.assign_user_to_group(user_id, feature)
+        
+        # Один пользователь всегда в одной группе
+        assert group1 == group2
+        assert isinstance(group1, ABTestGroup)
+    
+    def test_different_users_different_groups(self):
+        """Тест что разные пользователи могут попасть в разные группы"""
+        feature = "new_ui"
+        groups = set()
+        
+        # Назначаем много пользователей
+        for i in range(100):
+            user_id = f"user{i}"
+            group = self.ab_manager.assign_user_to_group(user_id, feature)
+            groups.add(group)
+        
+        # Должно быть больше одной группы
+        assert len(groups) > 1
+    
+    def test_record_conversion(self):
+        """Тест записи конверсий"""
+        user_id = "user123"
+        feature = "new_ui"
+        
+        # Назначаем пользователя
+        group = self.ab_manager.assign_user_to_group(user_id, feature)
+        
+        # Записываем конверсию
+        self.ab_manager.record_conversion(user_id, feature, True)
+        
+        # Проверяем что запись добавилась
+        assert len(self.ab_manager.test_results) == 1
+        
+        result = self.ab_manager.test_results[0]
+        assert result.user_id == user_id
+        assert result.feature == feature
+        assert result.group == group
+        assert result.conversion is True
+    
+    def test_statistics(self):
+        """Тест статистики A/B тестов"""
+        feature = "new_ui"
+        
+        # Добавляем тестовые данные
+        users_data = [
+            ("user1", True),   # конверсия
+            ("user2", False),  # нет конверсии
+            ("user3", True),   # конверсия
+            ("user4", False),  # нет конверсии
+            ("user5", True),   # конверсия
+        ]
+        
+        for user_id, converted in users_data:
+            self.ab_manager.assign_user_to_group(user_id, feature)
+            self.ab_manager.record_conversion(user_id, feature, converted)
+        
+        # Получаем статистику
+        stats = self.ab_manager.get_test_statistics(feature)
+        
+        # Проверяем структуру статистики
+        assert isinstance(stats, dict)
+        for group in ABTestGroup:
+            assert group.value in stats
+            group_stats = stats[group.value]
+            assert "total_users" in group_stats
+            assert "conversions" in group_stats
+            assert "conversion_rate" in group_stats
+        
+        # Проверяем общие числа
+        total_users = sum(stats[group.value]["total_users"] for group in ABTestGroup)
+        total_conversions = sum(stats[group.value]["conversions"] for group in ABTestGroup)
+        
+        assert total_users == 5
+        assert total_conversions == 3  # 3 конверсии из 5
+
+
+class TestIntegration:
+    """Интеграционные тесты"""
+    
+    def test_full_workflow(self):
+        """Тест полного рабочего процесса"""
+        # 1. Создаем блокчейн
+        blockchain = Blockchain()
+        
+        # 2. Генерируем ключи
+        keys = CryptoManager.generate_key_pair()
+        assert keys is not None
+        
+        # 3. Создаем и добавляем транзакцию
+        genesis_utxos = blockchain.utxo_manager.get_utxos_for_address("genesis_address")
+        
+        transaction = Transaction(
+            id=str(uuid.uuid4()),
+            inputs=[TransactionInput(
+                tx_id=genesis_utxos[0]["tx_id"],
+                output_index=genesis_utxos[0]["output_index"]
+            )],
+            outputs=[
+                TransactionOutput(amount=100.0, recipient="alice"),
+                TransactionOutput(amount=899.0, recipient="genesis_address")
+            ],
+            timestamp=time.time(),
+            fee=1.0
+        )
+        
+        success = blockchain.add_transaction(transaction)
+        assert success is True
+        
+        # 4. Майним блок
+        new_block = blockchain.mine_block(difficulty=1)
+        assert new_block is not None
+        assert len(blockchain.chain) == 2
+        
+        # 5. Проверяем баланс
+        alice_balance = blockchain.utxo_manager.get_balance("alice")
+        assert alice_balance == 100.0
+        
+        # 6. A/B тест
+        ab_manager = ABTestManager()
+        group = ab_manager.assign_user_to_group("alice", "wallet_ui")
+        ab_manager.record_conversion("alice", "wallet_ui", True)
+        
+        stats = ab_manager.get_test_statistics("wallet_ui")
+        assert stats is not None
+        
+        print("✅ Все интеграционные тесты прошли успешно!")
+
+
+if __name__ == "__main__":
+    # Можно запустить напрямую для быстрой проверки
+    print("Запуск основных тестов...")
+    
+    # Тест криптографии
+    crypto_test = TestCryptoManager()
+    crypto_test.test_digital_signature()
+    print("✅ Криптография работает")
+    
+    # Тест UTXO
+    utxo_test = TestUTXOManager()
+    utxo_test.setup_method()
+    utxo_test.test_spend_utxo()
+    print("✅ UTXO система работает")
+    
+    # Тест блокчейна
+    blockchain_test = TestBlockchain()
+    blockchain_test.setup_method()
+    blockchain_test.test_genesis_block()
+    print("✅ Блокчейн работает")
+    
+    # Тест A/B
+    ab_test = TestABTestManager()
+    ab_test.setup_method()
+    ab_test.test_user_assignment()
+    print("✅ A/B тестирование работает")
+    
+    # Интеграционный тест
+    integration_test = TestIntegration()
+    integration_test.test_full_workflow()
+    
+    print("\n🎉 Все тесты успешно пройдены!")
+    print("Для полного запуска используйте: python -m pytest test_blockchain.py -v")
