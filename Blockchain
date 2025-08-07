@@ -1,0 +1,625 @@
+# Blockchain Portfolio API
+# Демонстрация навыков: FastAPI, криптография, блокчейн, UTXO, A/B тестирование
+
+from fastapi import FastAPI, HTTPException, Depends, Header
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
+import hashlib
+import json
+import time
+from datetime import datetime
+import secrets
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.backends import default_backend
+import uuid
+from enum import Enum
+import random
+
+app = FastAPI(
+    title="Blockchain Portfolio API",
+    description="Демонстрация навыков разработки блокчейн приложений",
+    version="1.0.0"
+)
+
+# ================ МОДЕЛИ ДАННЫХ ================
+
+class TransactionInput(BaseModel):
+    """UTXO вход транзакции"""
+    tx_id: str
+    output_index: int
+    signature: Optional[str] = None
+
+class TransactionOutput(BaseModel):
+    """UTXO выход транзакции"""
+    amount: float = Field(..., gt=0)
+    recipient: str
+    
+class Transaction(BaseModel):
+    """Модель транзакции в UTXO модели"""
+    id: str
+    inputs: List[TransactionInput]
+    outputs: List[TransactionOutput]
+    timestamp: float
+    fee: float = 0.001
+
+class Block(BaseModel):
+    """Модель блока блокчейна"""
+    index: int
+    timestamp: float
+    transactions: List[Transaction]
+    previous_hash: str
+    nonce: int = 0
+    hash: Optional[str] = None
+
+class ABTestGroup(str, Enum):
+    """Группы для A/B тестирования"""
+    CONTROL = "control"
+    VARIANT_A = "variant_a"
+    VARIANT_B = "variant_b"
+
+class ABTestResult(BaseModel):
+    """Результат A/B теста"""
+    user_id: str
+    group: ABTestGroup
+    feature: str
+    conversion: bool
+    timestamp: float
+
+# ================ КРИПТОГРАФИЧЕСКИЕ ФУНКЦИИ ================
+
+class CryptoManager:
+    """Управление криптографическими операциями"""
+    
+    @staticmethod
+    def generate_key_pair():
+        """Генерация пары ключей RSA"""
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        public_key = private_key.public_key()
+        
+        # Сериализация ключей
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        
+        public_pem = public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        
+        return {
+            "private_key": private_pem.decode(),
+            "public_key": public_pem.decode()
+        }
+    
+    @staticmethod
+    def sign_data(private_key_pem: str, data: str) -> str:
+        """Цифровая подпись данных"""
+        private_key = serialization.load_pem_private_key(
+            private_key_pem.encode(),
+            password=None,
+            backend=default_backend()
+        )
+        
+        signature = private_key.sign(
+            data.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        
+        return signature.hex()
+    
+    @staticmethod
+    def verify_signature(public_key_pem: str, data: str, signature: str) -> bool:
+        """Проверка цифровой подписи"""
+        try:
+            public_key = serialization.load_pem_public_key(
+                public_key_pem.encode(),
+                backend=default_backend()
+            )
+            
+            public_key.verify(
+                bytes.fromhex(signature),
+                data.encode(),
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            return True
+        except Exception:
+            return False
+    
+    @staticmethod
+    def hash_data(data: str) -> str:
+        """SHA-256 хеширование"""
+        return hashlib.sha256(data.encode()).hexdigest()
+    
+    @staticmethod
+    def merkle_root(hashes: List[str]) -> str:
+        """Вычисление корня дерева Меркла"""
+        if not hashes:
+            return ""
+        if len(hashes) == 1:
+            return hashes[0]
+        
+        next_level = []
+        for i in range(0, len(hashes), 2):
+            left = hashes[i]
+            right = hashes[i + 1] if i + 1 < len(hashes) else hashes[i]
+            combined = left + right
+            next_level.append(hashlib.sha256(combined.encode()).hexdigest())
+        
+        return CryptoManager.merkle_root(next_level)
+
+# ================ UTXO СИСТЕМА ================
+
+class UTXOManager:
+    """Управление UTXO (Unspent Transaction Outputs)"""
+    
+    def __init__(self):
+        self.utxo_set: Dict[str, Dict[int, TransactionOutput]] = {}
+        self.spent_outputs: set = set()
+    
+    def add_utxo(self, tx_id: str, output_index: int, output: TransactionOutput):
+        """Добавление UTXO"""
+        if tx_id not in self.utxo_set:
+            self.utxo_set[tx_id] = {}
+        self.utxo_set[tx_id][output_index] = output
+    
+    def spend_utxo(self, tx_id: str, output_index: int) -> bool:
+        """Трата UTXO"""
+        utxo_key = f"{tx_id}:{output_index}"
+        if utxo_key in self.spent_outputs:
+            return False
+        
+        if tx_id in self.utxo_set and output_index in self.utxo_set[tx_id]:
+            self.spent_outputs.add(utxo_key)
+            return True
+        return False
+    
+    def get_balance(self, address: str) -> float:
+        """Получение баланса адреса"""
+        balance = 0.0
+        for tx_id, outputs in self.utxo_set.items():
+            for output_index, output in outputs.items():
+                utxo_key = f"{tx_id}:{output_index}"
+                if output.recipient == address and utxo_key not in self.spent_outputs:
+                    balance += output.amount
+        return balance
+    
+    def get_utxos_for_address(self, address: str) -> List[Dict]:
+        """Получение всех UTXO для адреса"""
+        utxos = []
+        for tx_id, outputs in self.utxo_set.items():
+            for output_index, output in outputs.items():
+                utxo_key = f"{tx_id}:{output_index}"
+                if output.recipient == address and utxo_key not in self.spent_outputs:
+                    utxos.append({
+                        "tx_id": tx_id,
+                        "output_index": output_index,
+                        "amount": output.amount
+                    })
+        return utxos
+
+# ================ БЛОКЧЕЙН ================
+
+class Blockchain:
+    """Простая реализация блокчейна"""
+    
+    def __init__(self):
+        self.chain: List[Block] = []
+        self.pending_transactions: List[Transaction] = []
+        self.utxo_manager = UTXOManager()
+        self.create_genesis_block()
+    
+    def create_genesis_block(self):
+        """Создание генезис блока"""
+        genesis_transaction = Transaction(
+            id=str(uuid.uuid4()),
+            inputs=[],
+            outputs=[TransactionOutput(amount=1000.0, recipient="genesis_address")],
+            timestamp=time.time(),
+            fee=0.0
+        )
+        
+        genesis_block = Block(
+            index=0,
+            timestamp=time.time(),
+            transactions=[genesis_transaction],
+            previous_hash="0",
+            nonce=0
+        )
+        
+        genesis_block.hash = self.calculate_hash(genesis_block)
+        self.chain.append(genesis_block)
+        
+        # Добавляем UTXO из генезис блока
+        self.utxo_manager.add_utxo(
+            genesis_transaction.id, 
+            0, 
+            genesis_transaction.outputs[0]
+        )
+    
+    def calculate_hash(self, block: Block) -> str:
+        """Вычисление хеша блока"""
+        block_string = json.dumps({
+            "index": block.index,
+            "timestamp": block.timestamp,
+            "transactions": [tx.dict() for tx in block.transactions],
+            "previous_hash": block.previous_hash,
+            "nonce": block.nonce
+        }, sort_keys=True)
+        return hashlib.sha256(block_string.encode()).hexdigest()
+    
+    def validate_transaction(self, transaction: Transaction) -> bool:
+        """Валидация транзакции"""
+        # Проверяем, что все входы существуют и не потрачены
+        total_input = 0.0
+        for tx_input in transaction.inputs:
+            if tx_input.tx_id not in self.utxo_manager.utxo_set:
+                return False
+            
+            utxo_key = f"{tx_input.tx_id}:{tx_input.output_index}"
+            if utxo_key in self.utxo_manager.spent_outputs:
+                return False
+            
+            if tx_input.output_index not in self.utxo_manager.utxo_set[tx_input.tx_id]:
+                return False
+            
+            total_input += self.utxo_manager.utxo_set[tx_input.tx_id][tx_input.output_index].amount
+        
+        # Проверяем баланс
+        total_output = sum(output.amount for output in transaction.outputs) + transaction.fee
+        return total_input >= total_output
+    
+    def add_transaction(self, transaction: Transaction) -> bool:
+        """Добавление транзакции в пул"""
+        if self.validate_transaction(transaction):
+            self.pending_transactions.append(transaction)
+            return True
+        return False
+    
+    def mine_block(self, difficulty: int = 2) -> Block:
+        """Майнинг блока с Proof of Work"""
+        if not self.pending_transactions:
+            raise ValueError("Нет транзакций для майнинга")
+        
+        new_block = Block(
+            index=len(self.chain),
+            timestamp=time.time(),
+            transactions=self.pending_transactions.copy(),
+            previous_hash=self.chain[-1].hash
+        )
+        
+        # Proof of Work
+        target = "0" * difficulty
+        while True:
+            new_block.hash = self.calculate_hash(new_block)
+            if new_block.hash.startswith(target):
+                break
+            new_block.nonce += 1
+        
+        # Обновляем UTXO set
+        for transaction in new_block.transactions:
+            # Тратим входы
+            for tx_input in transaction.inputs:
+                self.utxo_manager.spend_utxo(tx_input.tx_id, tx_input.output_index)
+            
+            # Добавляем выходы
+            for i, output in enumerate(transaction.outputs):
+                self.utxo_manager.add_utxo(transaction.id, i, output)
+        
+        self.chain.append(new_block)
+        self.pending_transactions = []
+        return new_block
+
+# ================ A/B ТЕСТИРОВАНИЕ ================
+
+class ABTestManager:
+    """Управление A/B тестами"""
+    
+    def __init__(self):
+        self.test_results: List[ABTestResult] = []
+        self.user_groups: Dict[str, ABTestGroup] = {}
+    
+    def assign_user_to_group(self, user_id: str, feature: str) -> ABTestGroup:
+        """Назначение пользователя в группу A/B теста"""
+        # Детерминированное назначение на основе хеша
+        hash_input = f"{user_id}:{feature}"
+        hash_value = int(hashlib.md5(hash_input.encode()).hexdigest(), 16)
+        
+        group_index = hash_value % 3
+        groups = [ABTestGroup.CONTROL, ABTestGroup.VARIANT_A, ABTestGroup.VARIANT_B]
+        
+        assigned_group = groups[group_index]
+        self.user_groups[f"{user_id}:{feature}"] = assigned_group
+        return assigned_group
+    
+    def record_conversion(self, user_id: str, feature: str, converted: bool):
+        """Запись конверсии в A/B тесте"""
+        group = self.user_groups.get(f"{user_id}:{feature}")
+        if not group:
+            group = self.assign_user_to_group(user_id, feature)
+        
+        result = ABTestResult(
+            user_id=user_id,
+            group=group,
+            feature=feature,
+            conversion=converted,
+            timestamp=time.time()
+        )
+        self.test_results.append(result)
+    
+    def get_test_statistics(self, feature: str) -> Dict[str, Any]:
+        """Получение статистики A/B теста"""
+        feature_results = [r for r in self.test_results if r.feature == feature]
+        
+        stats = {}
+        for group in ABTestGroup:
+            group_results = [r for r in feature_results if r.group == group]
+            total = len(group_results)
+            conversions = sum(1 for r in group_results if r.conversion)
+            
+            stats[group.value] = {
+                "total_users": total,
+                "conversions": conversions,
+                "conversion_rate": (conversions / total * 100) if total > 0 else 0
+            }
+        
+        return stats
+
+# ================ ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ================
+
+blockchain = Blockchain()
+crypto_manager = CryptoManager()
+ab_test_manager = ABTestManager()
+
+# ================ API ENDPOINTS ================
+
+@app.get("/")
+async def root():
+    """Корневой endpoint"""
+    return {
+        "message": "Blockchain Portfolio API",
+        "features": [
+            "FastAPI framework",
+            "Криптографические операции",
+            "Блокчейн с UTXO моделью",
+            "A/B тестирование",
+            "Proof of Work майнинг"
+        ]
+    }
+
+# === КРИПТОГРАФИЧЕСКИЕ ENDPOINTS ===
+
+@app.post("/crypto/generate-keys")
+async def generate_keys():
+    """Генерация пары ключей RSA"""
+    return crypto_manager.generate_key_pair()
+
+@app.post("/crypto/sign")
+async def sign_data(data: dict):
+    """Подписание данных"""
+    private_key = data.get("private_key")
+    message = data.get("message")
+    
+    if not private_key or not message:
+        raise HTTPException(status_code=400, detail="Необходимы private_key и message")
+    
+    signature = crypto_manager.sign_data(private_key, message)
+    return {"signature": signature}
+
+@app.post("/crypto/verify")
+async def verify_signature(data: dict):
+    """Проверка подписи"""
+    public_key = data.get("public_key")
+    message = data.get("message")
+    signature = data.get("signature")
+    
+    if not all([public_key, message, signature]):
+        raise HTTPException(status_code=400, detail="Необходимы public_key, message и signature")
+    
+    is_valid = crypto_manager.verify_signature(public_key, message, signature)
+    return {"valid": is_valid}
+
+@app.post("/crypto/hash")
+async def hash_data(data: dict):
+    """Хеширование данных"""
+    message = data.get("message")
+    if not message:
+        raise HTTPException(status_code=400, detail="Необходим message")
+    
+    hash_result = crypto_manager.hash_data(message)
+    return {"hash": hash_result}
+
+# === БЛОКЧЕЙН ENDPOINTS ===
+
+@app.get("/blockchain/info")
+async def blockchain_info():
+    """Информация о блокчейне"""
+    return {
+        "chain_length": len(blockchain.chain),
+        "pending_transactions": len(blockchain.pending_transactions),
+        "latest_block_hash": blockchain.chain[-1].hash if blockchain.chain else None
+    }
+
+@app.get("/blockchain/blocks")
+async def get_blocks():
+    """Получение всех блоков"""
+    return {"blocks": [block.dict() for block in blockchain.chain]}
+
+@app.get("/blockchain/block/{block_index}")
+async def get_block(block_index: int):
+    """Получение блока по индексу"""
+    if block_index >= len(blockchain.chain) or block_index < 0:
+        raise HTTPException(status_code=404, detail="Блок не найден")
+    
+    return blockchain.chain[block_index].dict()
+
+@app.post("/blockchain/transaction")
+async def create_transaction(transaction_data: dict):
+    """Создание новой транзакции"""
+    try:
+        # Создаем транзакцию с уникальным ID
+        transaction = Transaction(
+            id=str(uuid.uuid4()),
+            inputs=[TransactionInput(**inp) for inp in transaction_data.get("inputs", [])],
+            outputs=[TransactionOutput(**out) for out in transaction_data.get("outputs", [])],
+            timestamp=time.time(),
+            fee=transaction_data.get("fee", 0.001)
+        )
+        
+        success = blockchain.add_transaction(transaction)
+        if success:
+            return {"message": "Транзакция добавлена", "transaction_id": transaction.id}
+        else:
+            raise HTTPException(status_code=400, detail="Невалидная транзакция")
+    
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/blockchain/mine")
+async def mine_block(difficulty: int = 2):
+    """Майнинг нового блока"""
+    try:
+        new_block = blockchain.mine_block(difficulty)
+        return {
+            "message": "Блок успешно добыт",
+            "block": new_block.dict()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/blockchain/balance/{address}")
+async def get_balance(address: str):
+    """Получение баланса адреса"""
+    balance = blockchain.utxo_manager.get_balance(address)
+    utxos = blockchain.utxo_manager.get_utxos_for_address(address)
+    
+    return {
+        "address": address,
+        "balance": balance,
+        "utxos": utxos
+    }
+
+# === A/B ТЕСТИРОВАНИЕ ENDPOINTS ===
+
+@app.post("/ab-test/assign/{user_id}")
+async def assign_ab_test(user_id: str, feature: str):
+    """Назначение пользователя в группу A/B теста"""
+    group = ab_test_manager.assign_user_to_group(user_id, feature)
+    return {
+        "user_id": user_id,
+        "feature": feature,
+        "assigned_group": group.value
+    }
+
+@app.post("/ab-test/conversion")
+async def record_conversion(conversion_data: dict):
+    """Запись конверсии"""
+    user_id = conversion_data.get("user_id")
+    feature = conversion_data.get("feature")
+    converted = conversion_data.get("converted", False)
+    
+    if not user_id or not feature:
+        raise HTTPException(status_code=400, detail="Необходимы user_id и feature")
+    
+    ab_test_manager.record_conversion(user_id, feature, converted)
+    return {"message": "Конверсия записана"}
+
+@app.get("/ab-test/stats/{feature}")
+async def get_ab_test_stats(feature: str):
+    """Получение статистики A/B теста"""
+    stats = ab_test_manager.get_test_statistics(feature)
+    return {
+        "feature": feature,
+        "statistics": stats
+    }
+
+# === ДЕМОНСТРАЦИОННЫЕ ENDPOINTS ===
+
+@app.post("/demo/full-cycle")
+async def demo_full_cycle():
+    """Демонстрация полного цикла работы системы"""
+    
+    # 1. Генерируем ключи
+    keys = crypto_manager.generate_key_pair()
+    
+    # 2. Создаем простую транзакцию от genesis адреса
+    transaction_data = {
+        "inputs": [],  # Genesis транзакция без входов
+        "outputs": [
+            {"amount": 50.0, "recipient": "alice_address"},
+            {"amount": 30.0, "recipient": "bob_address"}
+        ],
+        "fee": 1.0
+    }
+    
+    # Создаем транзакцию с UTXO от genesis
+    if blockchain.utxo_manager.get_balance("genesis_address") > 0:
+        genesis_utxos = blockchain.utxo_manager.get_utxos_for_address("genesis_address")
+        if genesis_utxos:
+            transaction_data["inputs"] = [{
+                "tx_id": genesis_utxos[0]["tx_id"],
+                "output_index": genesis_utxos[0]["output_index"]
+            }]
+    
+    transaction = Transaction(
+        id=str(uuid.uuid4()),
+        inputs=[TransactionInput(**inp) for inp in transaction_data["inputs"]],
+        outputs=[TransactionOutput(**out) for out in transaction_data["outputs"]],
+        timestamp=time.time(),
+        fee=transaction_data["fee"]
+    )
+    
+    # 3. Добавляем транзакцию и майним блок
+    blockchain.add_transaction(transaction)
+    new_block = blockchain.mine_block(difficulty=1)
+    
+    # 4. Назначаем пользователей в A/B тест
+    user1_group = ab_test_manager.assign_user_to_group("user_1", "new_ui")
+    user2_group = ab_test_manager.assign_user_to_group("user_2", "new_ui")
+    
+    # 5. Записываем конверсии
+    ab_test_manager.record_conversion("user_1", "new_ui", True)
+    ab_test_manager.record_conversion("user_2", "new_ui", False)
+    
+    # 6. Получаем статистику
+    ab_stats = ab_test_manager.get_test_statistics("new_ui")
+    
+    return {
+        "demo_results": {
+            "keys_generated": bool(keys),
+            "transaction_created": transaction.id,
+            "block_mined": {
+                "index": new_block.index,
+                "hash": new_block.hash[:16] + "...",
+                "transactions_count": len(new_block.transactions)
+            },
+            "balances": {
+                "alice": blockchain.utxo_manager.get_balance("alice_address"),
+                "bob": blockchain.utxo_manager.get_balance("bob_address"),
+                "genesis": blockchain.utxo_manager.get_balance("genesis_address")
+            },
+            "ab_test": {
+                "user1_group": user1_group.value,
+                "user2_group": user2_group.value,
+                "statistics": ab_stats
+            }
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
